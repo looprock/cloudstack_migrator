@@ -6,9 +6,9 @@ Migrate guest VMs from one host to another, including local data volumes
 This script was written to work with hosts running under KVM with local storage pools on each node. If you're doing something else, your mileage may vary.
 
 # Usage
-Unfortunately, this script uses both the [cloudstack API client](https://github.com/vast-engineering/cloudstack-python-client) and cloudmonkey. The only other strange dependency is paramiko.
+Unfortunately, this script uses both the [cloudstack API client](https://github.com/vast-engineering/cloudstack-python-client) and cloudmonkey.  The reason for this is because I started out using only the client and, due to some issues, eventually reverted to cloudmonkey for most of the heavy lifting. Sorry!
 
-The reason for this is because I started out using only the client and, due to some issues, eventually reverted to cloudmonkey for most of the heavy lifting. Sorry!
+The only other strange module dependency is paramiko.
 
 Set up passwordless ssh authentication and populate known_hosts files for all the servers in your cluster so they can transfer the data volume disk images between them.
 
