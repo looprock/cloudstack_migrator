@@ -1,0 +1,335 @@
+#!/usr/bin/env python -u
+"""Migrate guests from one cloudstack host to another."""
+import CloudStack
+from optparse import OptionParser
+import json
+import sys
+import datetime
+import shlex
+import subprocess
+import re
+import os
+import warnings
+import logging
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    import paramiko
+
+## config
+
+# cloudstack API config
+csapi = 'https://cloudstack.company.com/client/api'
+admin_apikey = 'xxxx-xxxx-xxxx-xxxx-xxxx'
+admin_secret = 'xxxx-xxxx-xxxx-xxxx-xxxx'
+
+# information for generating the temporary VM used to mount/unmount volumes
+zoneid = 'xxxx-xxxx-xxxx-xxxx-xxxx'
+networkid = 'xxxx-xxxx-xxxx-xxxx-xxxx'
+serviceofferingid = 'xxxx-xxxx-xxxx-xxxx-xxxx'
+templateid = 'xxxx-xxxx-xxxx-xxxx-xxxx'
+
+# logfile target: make sure this exists
+logdir = "/var/log/migrations"
+
+## END config
+
+thedatetime = datetime.datetime.today().strftime('%Y%m%d%H%M')
+
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+
+# console logging
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+cformat = logging.Formatter('%(message)s')
+#cformat = logging.Formatter('%(levelname)s: %(name)s - %(message)s')
+ch.setFormatter(cformat)
+logger.addHandler(ch)
+
+# file logging
+logname = '%s/migration-%s.log' % (logdir, thedatetime)
+fh = logging.FileHandler(logname)
+fh.setLevel(logging.DEBUG)
+lformat = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
+fh.setFormatter(lformat)
+logger.addHandler(fh)
+
+# cloudmonkey pre-command
+monkey = "cloudmonkey -c /root/.cloudmonkey/config"
+
+cmd_parser = OptionParser(version="%prog 0.1")
+cmd_parser.add_option("-s", "--skipdata", action="store_true", dest="skipdata", help="don't migrate systems with data volumes")
+cmd_parser.add_option("-d", "--dry", action="store_true", dest="dryrun", help="do a dry run but don't migrate anything")
+cmd_parser.add_option("-e", "--exclude", type="string", action="store", dest="exclude", help="Comma separated list of VM ids to exclude", default=None)
+(cmd_options, cmd_args) = cmd_parser.parse_args()
+
+excludes = []
+if cmd_options.exclude:
+    for i in cmd_options.exclude.split(","):
+        excludes.append(i.strip())
+
+cloudstack = CloudStack.Client(csapi, admin_apikey, admin_secret)
+
+def whichhost(type, err):
+    """Ask which host."""
+    if err:
+        print ""
+        print err
+    else:
+        print ""
+    print "Which host would you like to migrate %s?" % type
+    return raw_input()
+
+
+def comm(command_line):
+    """Execute a command via subprocess."""
+    """Return output of a system command."""
+    process = subprocess.Popen(shlex.split(command_line), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, error = process.communicate()
+    return {'out': out, 'error': error}
+
+
+def runcom(tmpcom):
+    """Simplify command and debug output."""
+    logger.debug("tmpcom: %s" % tmpcom)
+    if not cmd_options.dryrun:
+        x = comm(tmpcom)
+        if x['error']:
+            logger.error(x['error'])
+            sys.exit(1)
+        logger.debug(x['out'])
+
+
+def getvalue(string, input):
+    """Find a string in a text block."""
+    logger.debug("input:")
+    logger.debug(repr(input))
+    v = None
+    for i in input.split("\n"):
+        matchobj = re.match(r'^' + string + ' = (.*)$', i)
+        if matchobj:
+            v = matchobj.group(1)
+            # I had to revert to text output in cloudmonkey, which also has an 'id' in network bits. trying first match
+            break
+    return v
+
+
+def process_volname(name):
+    """We don't want to keep appending YYYYMMDDHHMM to everything forever, that would make for LONG names."""
+    matchobj = re.match(r'^(.*)-(\d{12})$', name)
+    if matchobj:
+        v = matchobj.group(1)
+    else:
+        v = name
+    return v
+
+hosts = cloudstack.listHosts()
+hnames = {}
+for i in hosts:
+    if i['type'] == "Routing":
+        tmpdict = {}
+        tmpdict['id'] = i['id']
+        tmpdict['ipaddress'] = i['ipaddress']
+        hnames[i['name']] = tmpdict
+
+print "Cluster Hosts:"
+for i in sorted(hnames.keys()):
+    print i
+
+err = ""
+fromhost = whichhost("FROM", err)
+while fromhost not in hnames.keys():
+    err = "ERROR: sorry %s isn't a valid option!" % fromhost
+    fromhost = whichhost("FROM", err)
+fromhostid = hnames[fromhost]['id']
+logger.debug("using fromhost id: %s" % fromhostid)
+
+err = ""
+tohost = whichhost("TO", err)
+while tohost not in hnames.keys():
+    err = "ERROR: sorry %s isn't a valid option!" % tohost
+    tohost = whichhost("TO", err)
+tohostid = hnames[tohost]['id']
+tohostip = hnames[tohost]['ipaddress']
+logger.debug("using tohost id: %s" % tohostid)
+logger.debug("using tohost ipaddress: %s" % tohostip)
+
+# we need the storageid to migrate a stopped node. The only way to correleate is via IP of the target host
+tmpcom = "%s list storagepools ipaddress=%s filter=id" % (monkey, str(tohostip))
+logger.debug("storage pool tmpcom: %s" % tmpcom)
+storagepool = comm(tmpcom)
+poolid = getvalue('id', storagepool['out'])
+logger.debug("storage pool id: %s" % (str(poolid)))
+
+if tohostid == fromhostid:
+    sys.exit("ERROR: you can't use the same host as the target and destination!")
+
+guestids = {}
+move = cloudstack.listVirtualMachines({'hostid': fromhostid, 'listall': 'true'})
+for i in move:
+    if i['id'] in excludes:
+        logger.info("excluding VM id %s per command line option" % str(i['id']))
+    else:
+        tmp = {}
+        tmp['name'] = i['name']
+        tmp['displayname'] = i['displayname']
+        guestids[i['id']] = tmp
+        guestids[i['id']]['volumes'] = []
+
+# this tracks information about volumes
+volerr = {}
+logger.debug("getting list of volumes")
+vol = cloudstack.listVolumes({'listall': 'true'})
+for i in vol:
+    if 'virtualmachineid' in i:
+        if i['virtualmachineid'] in guestids.keys():
+            if not i['destroyed']:
+                if i['type'] != "ROOT":
+                    guestids[i['virtualmachineid']]['volumes'].append(str(i['id']))
+                    for l in json.dumps(i, indent=4, sort_keys=True).split("\n"):
+                        logger.debug(l)
+                    tmp = {}
+                    tmp['name'] = i['name']
+                    tmp['vmname'] = i['vmname']
+                    tmp['virtualmachineid'] = i['virtualmachineid']
+                    tmp['diskofferingid'] = i['diskofferingid']
+                    tmp['account'] = i['account']
+                    tmp['size'] = i['size']
+                    tmp['domainid'] = i['domainid']
+                    volerr[i['id']] = tmp
+
+print "\n"
+expunge = []
+wontmove = {}
+for i in guestids.keys():
+    if guestids[i]['volumes']:
+        if cmd_options.skipdata:
+            logger.warning("WARNING: Skipping migration of VMs with data volumes")
+            break
+        if len(guestids[i]['volumes']) > 1:
+            # I want to print the output regardless because it's useful in running the manual migration later
+            logger.error("%s (%s) is reporting too many volumes %s for this script to handle. You'll need to move this manually!" % (str(guestids[i]['displayname']), str(i), str(len(guestids[i]['volumes']))))
+            logger.error("printing out response for diagnostic reasons below. No action is being taken for this migration.")
+            wontmove[str(guestids[i]['displayname'])] = str(i)
+            cmd_options.dryrun = True
+        # since I'm not supporting multi-volume migrations
+        volid = guestids[i]['volumes'][0]
+        # volid = '7d0d82a9-978e-429d-9d42-e69ba449eede'
+        logger.warning(" *** found non-root volume %s (%s) for %s! (%s)" % (str(volerr[volid]['name']), volid, str(volerr[volid]['vmname']), str(volerr[volid]['virtualmachineid'])))
+        logger.warning("Attempting to migrate this system and data volume to %s" % str(tohost))
+        tmpcom = "%s list diskofferings id=%s" % (monkey, str(volerr[volid]['diskofferingid']))
+        logger.debug(tmpcom)
+        tmpdo = comm(tmpcom)
+        logger.debug("tmpdo:")
+        logger.debug(tmpdo)
+        iscustomized = getvalue('iscustomized', tmpdo['out'])
+        if not iscustomized:
+            logger.error("unable to get diskoffering iscustomized info")
+            sys.exit(1)
+        logger.debug("iscustomized type: %s" % str(type(iscustomized)))
+        voldisplayname = "%s-%s" % (process_volname(volerr[volid]['name']), thedatetime)
+        logger.debug("creating temp volume %s" % (voldisplayname))
+        gigsize = int(volerr[volid]['size']) / 1024 / 1024 / 1024
+        if iscustomized != "False":
+            tmpcom = "%s create volume account=%s size=%s diskofferingid=%s name=%s domainid=%s zoneid=%s" % (monkey, str(volerr[volid]['account']), str(gigsize), str(volerr[volid]['diskofferingid']), str(voldisplayname), str(volerr[volid]['domainid']), str(zoneid))
+        else:
+            tmpcom = "%s create volume account=%s diskofferingid=%s name=%s domainid=%s zoneid=%s" % (monkey, str(volerr[volid]['account']), str(volerr[volid]['diskofferingid']), str(voldisplayname), str(volerr[volid]['domainid']), str(zoneid))
+        logger.debug("executing: %s" % tmpcom)
+        if not cmd_options.dryrun:
+            crtmpvol = comm(tmpcom)
+            logger.debug(crtmpvol)
+            nvolid = getvalue('id', crtmpvol['out'])
+        else:
+            nvolid = "fake-volume"
+        if not nvolid:
+            logger.error("unable to get ID for new volume")
+            sys.exit(1)
+        logger.debug("nvolid: %s" % nvolid)
+        logger.info("new volume %s (%s) created!" % (str(voldisplayname), nvolid))
+        vmdisplayname = "%s-migrator" % volerr[volid]['vmname']
+        tmpcom = "%s deploy virtualmachine zoneid=%s networkids=%s serviceofferingid=%s templateid=%s displayname=%s hostid=%s account=%s domainid=%s" % (monkey, zoneid, networkid, serviceofferingid, templateid, vmdisplayname, tohostid, str(volerr[volid]['account']), str(volerr[volid]['domainid']))
+        logger.debug(tmpcom)
+        if not cmd_options.dryrun:
+            vminfo = comm(str(tmpcom))
+            tmpvmid = getvalue('id', vminfo['out'])
+        else:
+            tmpvmid = "fake-vm"
+        logger.info("created temporary VM %s (%s) to mount new volume %s (%s)" % (vmdisplayname, str(tmpvmid), str(voldisplayname), nvolid))
+        logger.info("stopping VM %s (%s) to be migrated." % (str(volerr[volid]['vmname']), str(volerr[volid]['virtualmachineid'])))
+        tmpcom = "%s stop virtualmachine id=%s forced=true" % (monkey, str(volerr[volid]['virtualmachineid']))
+        x = runcom(tmpcom)
+        logger.info("attaching volume %s (%s) to virtual machine %s (%s)" % (str(voldisplayname), str(nvolid), vmdisplayname, str(volerr[volid]['virtualmachineid'])))
+        tmpcom = "%s attach volume id=%s virtualmachineid=%s" % (monkey, str(nvolid), str(tmpvmid))
+        x = runcom(tmpcom)
+        logger.info("detaching volume %s (%s) from virtual machine %s (%s)" % (str(voldisplayname), str(nvolid), vmdisplayname, str(volerr[volid]['virtualmachineid'])))
+        tmpcom = "%s detach volume id=%s" % (monkey, str(nvolid))
+        x = runcom(tmpcom)
+        logger.info("destroying temporary VM %s (%s)" % (vmdisplayname, str(volerr[volid]['virtualmachineid'])))
+        if not cmd_options.dryrun:
+            cloudstack.destroyVirtualMachine({'id': str(tmpvmid), 'expunge': 'true'})
+        # rsync volume to new home
+        images = "/var/lib/libvirt/images"
+        if not cmd_options.dryrun:
+            s = paramiko.SSHClient()
+            s.load_system_host_keys()
+            privatekeyfile = os.path.expanduser('/root/.ssh/id_dsa')
+            mykey = paramiko.DSSKey.from_private_key_file(privatekeyfile)
+            fullhost = "%s.oak.vast.com" % fromhost
+            s.connect(hostname=fullhost, username='root', pkey=mykey)
+            command = 'rsync -e ssh -av %s/%s %s:%s/%s' % (images, volid, tohost, images, str(nvolid))
+            logger.info("executing: %s from %s" % (command, str(fromhost)))
+            (stdin, stdout, stderr) = s.exec_command(command)
+            for line in stdout.readlines():
+                logger.info(line)
+            s.close()
+        else:
+            command = 'scp %s/%s %s:%s/%s' % (images, volid, tohost, images, str(nvolid))
+            logger.info("executing: %s from %s" % (command, str(fromhost)))
+        logger.info("detaching old volume %s (%s) from target host %s (%s)" % (str(volerr[volid]['name']), str(volid), str(volerr[volid]['vmname']), str(volerr[volid]['virtualmachineid'])))
+        tmpcom = "%s detach volume id=%s" % (monkey, str(volid))
+        x = runcom(tmpcom)
+        logger.info("migrating target vm %s (%s) to new host %s" % (str(volerr[volid]['vmname']), str(volerr[volid]['virtualmachineid']), tohost))
+        tmpcom = "%s migrate virtualmachine virtualmachineid=%s storageid=%s" % (monkey, str(volerr[volid]['virtualmachineid']), str(poolid))
+        x = runcom(tmpcom)
+        logger.info("attaching new storage %s (%s) to target VM %s (%s)" % (str(voldisplayname), nvolid, str(volerr[volid]['vmname']), str(volerr[volid]['virtualmachineid'])))
+        tmpcom = "%s attach volume id=%s virtualmachineid=%s" % (monkey, str(nvolid), str(volerr[volid]['virtualmachineid']))
+        x = runcom(tmpcom)
+        logger.info("starting target VM %s (%s) on new host %s" % (str(volerr[volid]['vmname']), str(volerr[volid]['virtualmachineid']), tohost))
+        tmpcom = "%s start virtualmachine id=%s" % (monkey, str(volerr[volid]['virtualmachineid']))
+        x = runcom(tmpcom)
+        expunge.append(str(volid))
+        logger.info("IMPORTANT: please run '%s delete volume id=%s' when you're sure everything transferred correctly" % (monkey, str(volid)))
+        logger.info(" *** migration of vm %s complete!" % str(volerr[volid]['vmname']))
+
+for i in guestids.keys():
+    if not guestids[i]['volumes']:
+        logger.info(" *** Attempting to migrate %s (%s) to %s.." % (guestids[i]['displayname'], i, tohost))
+        logger.info("stopping VM %s (%s) to be migrated." % (str(guestids[i]['displayname']), str(i)))
+        tmpcom = "%s stop virtualmachine id=%s forced=true" % (monkey, str(i))
+        x = runcom(tmpcom)
+        logger.info("migrating target vm %s (%s) to new host %s" % (str(guestids[i]['displayname']), str(i), tohost))
+        tmpcom = "%s migrate virtualmachine virtualmachineid=%s storageid=%s" % (monkey, str(i), str(poolid))
+        x = runcom(tmpcom)
+        logger.info("starting target VM %s (%s) on new host %s" % (str(guestids[i]['displayname']), str(i), tohost))
+        tmpcom = "%s start virtualmachine id=%s" % (monkey, str(i))
+        x = runcom(tmpcom)
+        logger.info(" *** migration of vm %s complete!" % str(guestids[i]['displayname']))
+
+print "\n"
+logger.debug("expunge:")
+logger.debug(expunge)
+if expunge:
+    print "\n"
+    logging.warning(" ########### IMPORTANT: please expunge your old volumes by running the following when you're sure everything transferred correctly")
+    for i in expunge:
+        logging.warning("%s delete volume id=%s" % (monkey, i))
+    print "\n"
+
+logger.debug("wontmove:")
+logger.debug(wontmove)
+if wontmove:
+    logger.error(" ########### WON'T MOVE THE FOLLOWING!")
+    for i in wontmove.keys():
+        print "\n"
+        logger.error(" *** ERROR: %s (%s) is reporting too many volumes for this script to handle. You'll need to move this manually!" % (i, wontmove[i]))
+    print "\n"
