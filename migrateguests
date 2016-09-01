@@ -42,7 +42,7 @@ logger.setLevel(logging.DEBUG)
 ch = logging.StreamHandler()
 ch.setLevel(logging.INFO)
 cformat = logging.Formatter('%(message)s')
-#cformat = logging.Formatter('%(levelname)s: %(name)s - %(message)s')
+# cformat = logging.Formatter('%(levelname)s: %(name)s - %(message)s')
 ch.setFormatter(cformat)
 logger.addHandler(ch)
 
@@ -61,6 +61,7 @@ cmd_parser = OptionParser(version="%prog 0.1")
 cmd_parser.add_option("-s", "--skipdata", action="store_true", dest="skipdata", help="don't migrate systems with data volumes")
 cmd_parser.add_option("-d", "--dry", action="store_true", dest="dryrun", help="do a dry run but don't migrate anything")
 cmd_parser.add_option("-e", "--exclude", type="string", action="store", dest="exclude", help="Comma separated list of VM ids to exclude", default=None)
+cmd_parser.add_option("-o", "--only", type="string", action="store", dest="only", help="Comma separated list of VM ids to move", default=None)
 (cmd_options, cmd_args) = cmd_parser.parse_args()
 
 excludes = []
@@ -68,7 +69,14 @@ if cmd_options.exclude:
     for i in cmd_options.exclude.split(","):
         excludes.append(i.strip())
 
+only = []
+if cmd_options.only:
+    logger.debug("only flag used, only migrating the following guests: %s" % cmd_options.only)
+    for i in cmd_options.only.split(","):
+        only.append(i.strip())
+
 cloudstack = CloudStack.Client(csapi, admin_apikey, admin_secret)
+
 
 def whichhost(type, err):
     """Ask which host."""
@@ -198,10 +206,19 @@ for i in vol:
                     tmp['domainid'] = i['domainid']
                     volerr[i['id']] = tmp
 
+
+# if the only flag is used, overwrite the list of guests to migrate
+if only:
+    logger.info("moving only the following guests:")
+    logger.info(only)
+    mvguests = only
+else:
+    mvguests = guestids.keys()
+
 print "\n"
 expunge = []
 wontmove = {}
-for i in guestids.keys():
+for i in mvguests:
     if guestids[i]['volumes']:
         if cmd_options.skipdata:
             logger.warning("WARNING: Skipping migration of VMs with data volumes")
@@ -301,7 +318,7 @@ for i in guestids.keys():
         logger.info("IMPORTANT: please run '%s delete volume id=%s' when you're sure everything transferred correctly" % (monkey, str(volid)))
         logger.info(" *** migration of vm %s complete!" % str(volerr[volid]['vmname']))
 
-for i in guestids.keys():
+for i in mvguests:
     if not guestids[i]['volumes']:
         logger.info(" *** Attempting to migrate %s (%s) to %s.." % (guestids[i]['displayname'], i, tohost))
         logger.info("stopping VM %s (%s) to be migrated." % (str(guestids[i]['displayname']), str(i)))
